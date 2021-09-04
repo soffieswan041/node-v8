@@ -312,7 +312,7 @@ class Simulator : public SimulatorBase {
   void set_register(int reg, int64_t value);
   void set_register_word(int reg, int32_t value);
   void set_dw_register(int dreg, const int* dbl);
-  int64_t get_register(int reg) const;
+  V8_EXPORT_PRIVATE int64_t get_register(int reg) const;
   double get_double_from_register_pair(int reg);
 
   // Same for FPURegisters.
@@ -354,7 +354,7 @@ class Simulator : public SimulatorBase {
 
   // Special case of set_register and get_register to access the raw PC value.
   void set_pc(int64_t value);
-  int64_t get_pc() const;
+  V8_EXPORT_PRIVATE int64_t get_pc() const;
 
   Address get_sp() const { return static_cast<Address>(get_register(sp)); }
 
@@ -522,11 +522,15 @@ class Simulator : public SimulatorBase {
     set_register(rvc_rs1s_reg(), value);
     if (trace) TraceRegWr(get_register(rvc_rs1s_reg()), DWORD);
   }
+  inline void set_rvc_rs2(int64_t value, bool trace = true) {
+    set_register(rvc_rs2_reg(), value);
+    if (trace) TraceRegWr(get_register(rvc_rs2_reg()), DWORD);
+  }
   inline void set_rvc_drd(double value, bool trace = true) {
     set_fpu_register_double(rvc_rd_reg(), value);
     if (trace) TraceRegWr(get_fpu_register(rvc_rd_reg()), DOUBLE);
   }
-  inline void set_rvc_rs2s(double value, bool trace = true) {
+  inline void set_rvc_rs2s(int64_t value, bool trace = true) {
     set_register(rvc_rs2s_reg(), value);
     if (trace) TraceRegWr(get_register(rvc_rs2s_reg()), DWORD);
   }
@@ -610,6 +614,7 @@ class Simulator : public SimulatorBase {
     return alu_out;
   }
 
+  Builtin LookUp(Address pc);
   // RISCV decoding routine
   void DecodeRVRType();
   void DecodeRVR4Type();

@@ -521,10 +521,6 @@ void Serializer::ObjectSerializer::SerializeJSArrayBuffer() {
   ArrayBufferExtension* extension = buffer->extension();
 
   // The embedder-allocated backing store only exists for the off-heap case.
-#ifdef V8_HEAP_SANDBOX
-  uint32_t external_pointer_entry =
-      buffer->GetBackingStoreRefForDeserialization();
-#endif
   if (backing_store != nullptr) {
     uint32_t ref = SerializeBackingStore(backing_store, byte_length);
     buffer->SetBackingStoreRefForSerialization(ref);
@@ -538,11 +534,7 @@ void Serializer::ObjectSerializer::SerializeJSArrayBuffer() {
 
   SerializeObject();
 
-#ifdef V8_HEAP_SANDBOX
-  buffer->SetBackingStoreRefForSerialization(external_pointer_entry);
-#else
   buffer->set_backing_store(isolate(), backing_store);
-#endif
   buffer->set_extension(extension);
 }
 
@@ -888,6 +880,26 @@ void Serializer::ObjectSerializer::VisitPointers(HeapObject host,
       serializer_->SerializeObject(obj);
     }
   }
+}
+
+void Serializer::ObjectSerializer::VisitCodePointer(HeapObject host,
+                                                    CodeObjectSlot slot) {
+  CHECK(V8_EXTERNAL_CODE_SPACE_BOOL);
+  // A version of VisitPointers() customized for CodeObjectSlot.
+  HandleScope scope(isolate());
+  DisallowGarbageCollection no_gc;
+
+  // TODO(v8:11880): support external code space.
+  PtrComprCageBase code_cage_base = GetPtrComprCageBase(host);
+  Object contents = slot.load(code_cage_base);
+  DCHECK(HAS_STRONG_HEAP_OBJECT_TAG(contents.ptr()));
+  DCHECK(contents.IsCode());
+
+  Handle<HeapObject> obj = handle(HeapObject::cast(contents), isolate());
+  if (!serializer_->SerializePendingObject(obj)) {
+    serializer_->SerializeObject(obj);
+  }
+  bytes_processed_so_far_ += kTaggedSize;
 }
 
 void Serializer::ObjectSerializer::OutputExternalReference(Address target,

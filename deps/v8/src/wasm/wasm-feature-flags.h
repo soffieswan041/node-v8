@@ -27,7 +27,12 @@
   /* Non-specified, V8-only experimental additions to the GC proposal */       \
   /* V8 side owner: jkummerow */                                               \
   V(gc_experiments, "garbage collection V8-only experimental features", false) \
-  V(nn_locals, "allow non-defaultable/non-nullable locals", false)             \
+  V(nn_locals,                                                                 \
+    "allow non-defaultable/non-nullable locals, validated with 'until end of " \
+    "block' semantics",                                                        \
+    false)                                                                     \
+  V(unsafe_nn_locals,                                                          \
+    "allow non-defaultable/non-nullable locals, no validation", false)         \
                                                                                \
   /* Typed function references proposal. */                                    \
   /* Official proposal: https://github.com/WebAssembly/function-references */  \
@@ -64,12 +69,6 @@
   /* Staged in v8.9 */                                                         \
   V(eh, "exception handling opcodes", false)                                   \
                                                                                \
-  /* Reference Types, a.k.a. reftypes proposal. */                             \
-  /* https://github.com/WebAssembly/reference-types */                         \
-  /* V8 side owner: ahaas */                                                   \
-  /* Staged in v7.8. */                                                        \
-  V(reftypes, "reference type opcodes", false)                                 \
-                                                                               \
   /* Tail call / return call proposal. */                                      \
   /* https://github.com/webassembly/tail-call */                               \
   /* V8 side owner: thibaudm */                                                \
@@ -92,6 +91,13 @@
   /* Staged in v8.7 * */                                                       \
   /* Shipped in v9.1 * */                                                      \
   V(simd, "SIMD opcodes", true)                                                \
+                                                                               \
+  /* Reference Types, a.k.a. reftypes proposal. */                             \
+  /* https://github.com/WebAssembly/reference-types */                         \
+  /* V8 side owner: ahaas */                                                   \
+  /* Staged in v7.8. */                                                        \
+  /* Shipped in v9.5 * */                                                      \
+  V(reftypes, "reference type opcodes", true)                                  \
                                                                                \
   /* Threads proposal. */                                                      \
   /* https://github.com/webassembly/threads */                                 \

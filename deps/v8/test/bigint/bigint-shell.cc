@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <cmath>
+#include <memory>
 #include <string>
 
 #include "src/bigint/bigint-internal.h"
@@ -27,9 +29,14 @@ int PrintHelp(char** argv) {
   return 1;
 }
 
-#define TESTS(V)             \
-  V(kKaratsuba, "karatsuba") \
-  V(kBurnikel, "burnikel") V(kToom, "toom") V(kFFT, "fft")
+#define TESTS(V)               \
+  V(kBarrett, "barrett")       \
+  V(kBurnikel, "burnikel")     \
+  V(kFFT, "fft")               \
+  V(kFromString, "fromstring") \
+  V(kKaratsuba, "karatsuba")   \
+  V(kToom, "toom")             \
+  V(kToString, "tostring")
 
 enum Operation { kNoOp, kList, kTest };
 
@@ -81,7 +88,7 @@ class RNG {
 
 static constexpr int kCharsPerDigit = kDigitBits / 4;
 
-static const char kConversionChars[] = "0123456789abcdef";
+static const char kConversionChars[] = "0123456789abcdefghijklmnopqrstuvwxyz";
 
 std::string FormatHex(Digits X) {
   X.Normalize();
@@ -155,23 +162,58 @@ class Runner {
     error_ = true;
   }
 
+  void AssertEquals(Digits X, int radix, char* expected, int expected_length,
+                    char* actual, int actual_length) {
+    if (expected_length == actual_length &&
+        std::memcmp(expected, actual, actual_length) == 0) {
+      return;
+    }
+    std::cerr << "Input:    " << FormatHex(X) << "\n";
+    std::cerr << "Radix:    " << radix << "\n";
+    std::cerr << "Expected: " << std::string(expected, expected_length) << "\n";
+    std::cerr << "Actual:   " << std::string(actual, actual_length) << "\n";
+    error_ = true;
+  }
+
+  void AssertEquals(const char* input, int input_length, int radix,
+                    Digits expected, Digits actual) {
+    if (Compare(expected, actual) == 0) return;
+    std::cerr << "Input:    " << std::string(input, input_length) << "\n";
+    std::cerr << "Radix:    " << radix << "\n";
+    std::cerr << "Expected: " << FormatHex(expected) << "\n";
+    std::cerr << "Actual:   " << FormatHex(actual) << "\n";
+    error_ = true;
+  }
+
   int RunTest() {
     int count = 0;
-    if (test_ == kKaratsuba) {
+    if (test_ == kBarrett) {
       for (int i = 0; i < runs_; i++) {
-        TestKaratsuba(&count);
+        TestBarrett(&count);
       }
     } else if (test_ == kBurnikel) {
       for (int i = 0; i < runs_; i++) {
         TestBurnikel(&count);
       }
+    } else if (test_ == kFFT) {
+      for (int i = 0; i < runs_; i++) {
+        TestFFT(&count);
+      }
+    } else if (test_ == kKaratsuba) {
+      for (int i = 0; i < runs_; i++) {
+        TestKaratsuba(&count);
+      }
     } else if (test_ == kToom) {
       for (int i = 0; i < runs_; i++) {
         TestToom(&count);
       }
-    } else if (test_ == kFFT) {
+    } else if (test_ == kToString) {
       for (int i = 0; i < runs_; i++) {
-        TestFFT(&count);
+        TestToString(&count);
+      }
+    } else if (test_ == kFromString) {
+      for (int i = 0; i < runs_; i++) {
+        TestFromString(&count);
       }
     } else {
       DCHECK(false);  // Unreachable.
@@ -291,6 +333,107 @@ class Runner {
     }
   }
 
+#if V8_ADVANCED_BIGINT_ALGORITHMS
+  void TestBarrett_Internal(int left_size, int right_size) {
+    ScratchDigits A(left_size);
+    ScratchDigits B(right_size);
+    GenerateRandom(A);
+    GenerateRandom(B);
+    int quotient_len = DivideResultLength(A, B);
+    // {DivideResultLength} doesn't expect to be called for sizes below
+    // {kBarrettThreshold} (which we do here to save time), so we have to
+    // manually adjust the allocated result length.
+    if (B.len() < kBarrettThreshold) quotient_len++;
+    int remainder_len = right_size;
+    ScratchDigits quotient(quotient_len);
+    ScratchDigits quotient_burnikel(quotient_len);
+    ScratchDigits remainder(remainder_len);
+    ScratchDigits remainder_burnikel(remainder_len);
+    processor()->DivideBarrett(quotient, remainder, A, B);
+    processor()->DivideBurnikelZiegler(quotient_burnikel, remainder_burnikel, A,
+                                       B);
+    AssertEquals(A, B, quotient_burnikel, quotient);
+    AssertEquals(A, B, remainder_burnikel, remainder);
+  }
+
+  void TestBarrett(int* count) {
+    // We pick a range around kBurnikelThreshold (instead of kBarrettThreshold)
+    // to save test execution time.
+    constexpr int kMin = kBurnikelThreshold / 2;
+    constexpr int kMax = 2 * kBurnikelThreshold;
+    // {DivideBarrett(A, B)} requires that A.len > B.len!
+    for (int right_size = kMin; right_size <= kMax; right_size++) {
+      for (int left_size = right_size + 1; left_size <= kMax; left_size++) {
+        TestBarrett_Internal(left_size, right_size);
+        if (error_) return;
+        (*count)++;
+      }
+    }
+    // We also test one random large case.
+    uint64_t random_bits = rng_.NextUint64();
+    int right_size = kBarrettThreshold + static_cast<int>(random_bits & 0x3FF);
+    random_bits >>= 10;
+    int left_size = right_size + 1 + static_cast<int>(random_bits & 0x3FFF);
+    random_bits >>= 14;
+    TestBarrett_Internal(left_size, right_size);
+    if (error_) return;
+    (*count)++;
+  }
+#else
+  void TestBarrett(int* count) {}
+#endif  // V8_ADVANCED_BIGINT_ALGORITHMS
+
+  void TestToString(int* count) {
+    constexpr int kMin = kToStringFastThreshold / 2;
+    constexpr int kMax = kToStringFastThreshold * 2;
+    for (int size = kMin; size < kMax; size++) {
+      ScratchDigits X(size);
+      GenerateRandom(X);
+      for (int radix = 2; radix <= 36; radix++) {
+        int chars_required = ToStringResultLength(X, radix, false);
+        int result_len = chars_required;
+        int reference_len = chars_required;
+        std::unique_ptr<char[]> result(new char[result_len]);
+        std::unique_ptr<char[]> reference(new char[reference_len]);
+        processor()->ToStringImpl(result.get(), &result_len, X, radix, false,
+                                  true);
+        processor()->ToStringImpl(reference.get(), &reference_len, X, radix,
+                                  false, false);
+        AssertEquals(X, radix, reference.get(), reference_len, result.get(),
+                     result_len);
+        if (error_) return;
+        (*count)++;
+      }
+    }
+  }
+
+  void TestFromString(int* count) {
+    constexpr int kMaxDigits = 1 << 20;  // Any large-enough value will do.
+    constexpr int kMin = kFromStringLargeThreshold / 2;
+    constexpr int kMax = kFromStringLargeThreshold * 2;
+    for (int size = kMin; size < kMax; size++) {
+      // To keep test execution times low, test one random radix every time.
+      // Valid range is 2 <= radix <= 36 (inclusive).
+      int radix = 2 + (rng_.NextUint64() % 35);
+      int num_chars = std::round(size * kDigitBits / std::log2(radix));
+      std::unique_ptr<char[]> chars(new char[num_chars]);
+      GenerateRandomString(chars.get(), num_chars, radix);
+      FromStringAccumulator accumulator(kMaxDigits);
+      FromStringAccumulator ref_accumulator(kMaxDigits);
+      const char* start = chars.get();
+      const char* end = chars.get() + num_chars;
+      accumulator.Parse(start, end, radix);
+      ref_accumulator.Parse(start, end, radix);
+      ScratchDigits result(accumulator.ResultLength());
+      ScratchDigits reference(ref_accumulator.ResultLength());
+      processor()->FromStringLarge(result, &accumulator);
+      processor()->FromStringClassic(reference, &ref_accumulator);
+      AssertEquals(start, num_chars, radix, result, reference);
+      if (error_) return;
+      (*count)++;
+    }
+  }
+
   int ParseOptions(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
       if (strcmp(argv[i], "--list") == 0) {
@@ -325,6 +468,9 @@ class Runner {
   }
 
  private:
+  // TODO(jkummerow): Also generate "non-random-looking" inputs, i.e. long
+  // strings of zeros and ones in the binary representation, such as
+  // ((1 << random) ± 1).
   void GenerateRandom(RWDigits Z) {
     if (Z.len() == 0) return;
     if (sizeof(digit_t) == 8) {
@@ -341,6 +487,30 @@ class Runner {
     // Special case: we don't want the MSD to be zero.
     while (Z.msd() == 0) {
       Z[Z.len() - 1] = static_cast<digit_t>(rng_.NextUint64());
+    }
+  }
+
+  void GenerateRandomString(char* str, int len, int radix) {
+    DCHECK(2 <= radix && radix <= 36);
+    if (len == 0) return;
+    uint64_t random;
+    int available_bits = 0;
+    const int char_bits = BitLength(radix - 1);
+    const uint64_t char_mask = (1u << char_bits) - 1u;
+    for (int i = 0; i < len; i++) {
+      while (true) {
+        if (available_bits < char_bits) {
+          random = rng_.NextUint64();
+          available_bits = 64;
+        }
+        int next_char = static_cast<int>(random & char_mask);
+        random = random >> char_bits;
+        available_bits -= char_bits;
+        if (next_char >= radix) continue;
+        *str = kConversionChars[next_char];
+        str++;
+        break;
+      };
     }
   }
 

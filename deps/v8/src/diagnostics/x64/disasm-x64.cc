@@ -244,8 +244,9 @@ static const InstructionDesc cmov_instructions[16] = {
     {"cmovle", TWO_OPERANDS_INSTR, REG_OPER_OP_ORDER, false},
     {"cmovg", TWO_OPERANDS_INSTR, REG_OPER_OP_ORDER, false}};
 
-static const char* const cmp_pseudo_op[8] = {"eq",  "lt",  "le",  "unord",
-                                             "neq", "nlt", "nle", "ord"};
+static const char* const cmp_pseudo_op[16] = {
+    "eq",    "lt",  "le",  "unord", "neq",    "nlt", "nle", "ord",
+    "eq_uq", "nge", "ngt", "false", "neq_oq", "ge",  "gt",  "true"};
 
 namespace {
 int8_t Imm8(const uint8_t* data) {
@@ -2799,8 +2800,9 @@ int DisassemblerX64::InstructionDecode(v8::base::Vector<char> out_buffer,
   for (byte* bp = instr; bp < data; bp++) {
     outp += v8::base::SNPrintF(out_buffer + outp, "%02x", *bp);
   }
-  // Indent instruction, leaving space for 7 bytes, i.e. 14 characters in hex.
-  while (outp < 14) {
+  // Indent instruction, leaving space for 9 bytes, i.e. 18 characters in hex.
+  // 9-byte nop and rip-relative mov are (probably) the largest we emit.
+  while (outp < 18) {
     outp += v8::base::SNPrintF(out_buffer + outp, "  ");
   }
 

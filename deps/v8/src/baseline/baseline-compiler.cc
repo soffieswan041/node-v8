@@ -4,14 +4,13 @@
 
 // TODO(v8:11421): Remove #if once baseline compiler is ported to other
 // architectures.
-#include "src/base/bits.h"
-#if V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 ||     \
-    V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_RISCV64 || V8_TARGET_ARCH_MIPS64 || \
-    V8_TARGET_ARCH_MIPS
+#include "src/flags/flags.h"
+#if ENABLE_SPARKPLUG
 
 #include <algorithm>
 #include <type_traits>
 
+#include "src/base/bits.h"
 #include "src/baseline/baseline-assembler-inl.h"
 #include "src/baseline/baseline-assembler.h"
 #include "src/baseline/baseline-compiler.h"
@@ -49,6 +48,8 @@
 #include "src/baseline/mips64/baseline-compiler-mips64-inl.h"
 #elif V8_TARGET_ARCH_MIPS
 #include "src/baseline/mips/baseline-compiler-mips-inl.h"
+#elif V8_TARGET_ARCH_LOONG64
+#include "src/baseline/loong64/baseline-compiler-loong64-inl.h"
 #else
 #error Unsupported target architecture.
 #endif
@@ -242,8 +243,10 @@ namespace {
 // than pre-allocating a large enough buffer.
 #ifdef V8_TARGET_ARCH_IA32
 const int kAverageBytecodeToInstructionRatio = 5;
+const int kMinimumEstimatedInstructionSize = 200;
 #else
 const int kAverageBytecodeToInstructionRatio = 7;
+const int kMinimumEstimatedInstructionSize = 300;
 #endif
 std::unique_ptr<AssemblerBuffer> AllocateBuffer(
     Isolate* isolate, Handle<BytecodeArray> bytecodes,
@@ -259,9 +262,6 @@ std::unique_ptr<AssemblerBuffer> AllocateBuffer(
   if (code_location == BaselineCompiler::kOnHeap &&
       Code::SizeFor(estimated_size) <
           heap->MaxRegularHeapObjectSize(AllocationType::kCode)) {
-    // TODO(victorgomes): We're currently underestimating the size of the
-    // buffer, since we don't know how big the reloc info will be. We could
-    // use a separate zone vector for the RelocInfo.
     return NewOnHeapAssemblerBuffer(isolate, estimated_size);
   }
   return NewAssemblerBuffer(RoundUp(estimated_size, 4 * KB));
@@ -271,7 +271,7 @@ std::unique_ptr<AssemblerBuffer> AllocateBuffer(
 BaselineCompiler::BaselineCompiler(
     Isolate* isolate, Handle<SharedFunctionInfo> shared_function_info,
     Handle<BytecodeArray> bytecode, CodeLocation code_location)
-    : isolate_(isolate),
+    : local_isolate_(isolate->AsLocalIsolate()),
       stats_(isolate->counters()->runtime_call_stats()),
       shared_function_info_(shared_function_info),
       bytecode_(bytecode),
@@ -329,7 +329,8 @@ MaybeHandle<Code> BaselineCompiler::Build(Isolate* isolate) {
 }
 
 int BaselineCompiler::EstimateInstructionSize(BytecodeArray bytecode) {
-  return bytecode.length() * kAverageBytecodeToInstructionRatio;
+  return bytecode.length() * kAverageBytecodeToInstructionRatio +
+         kMinimumEstimatedInstructionSize;
 }
 
 interpreter::Register BaselineCompiler::RegisterOperand(int operand_index) {
@@ -354,7 +355,7 @@ void BaselineCompiler::StoreRegisterPair(int operand_index, Register val0,
 template <typename Type>
 Handle<Type> BaselineCompiler::Constant(int operand_index) {
   return Handle<Type>::cast(
-      iterator().GetConstantForIndexOperand(operand_index, isolate_));
+      iterator().GetConstantForIndexOperand(operand_index, local_isolate_));
 }
 Smi BaselineCompiler::ConstantSmi(int operand_index) {
   return iterator().GetConstantAtIndexAsSmi(operand_index);
@@ -489,13 +490,31 @@ void BaselineCompiler::VisitSingleBytecode() {
   TraceBytecode(Runtime::kTraceUnoptimizedBytecodeEntry);
 #endif
 
-  switch (iterator().current_bytecode()) {
+  {
+    interpreter::Bytecode bytecode = iterator().current_bytecode();
+
+#ifdef DEBUG
+    base::Optional<EnsureAccumulatorPreservedScope> accumulator_preserved_scope;
+    // We should make sure to preserve the accumulator whenever the bytecode
+    // isn't registered as writing to it. We can't do this for jumps or switches
+    // though, since the control flow would not match the control flow of this
+    // scope.
+    if (FLAG_debug_code &&
+        !interpreter::Bytecodes::WritesAccumulator(bytecode) &&
+        !interpreter::Bytecodes::IsJump(bytecode) &&
+        !interpreter::Bytecodes::IsSwitch(bytecode)) {
+      accumulator_preserved_scope.emplace(&basm_);
+    }
+#endif  // DEBUG
+
+    switch (bytecode) {
 #define BYTECODE_CASE(name, ...)       \
   case interpreter::Bytecode::k##name: \
     Visit##name();                     \
     break;
-    BYTECODE_LIST(BYTECODE_CASE)
+      BYTECODE_LIST(BYTECODE_CASE)
 #undef BYTECODE_CASE
+    }
   }
 
 #ifdef V8_TRACE_UNOPTIMIZED
@@ -559,7 +578,7 @@ void BaselineCompiler::UpdateInterruptBudgetAndJumpToLabel(
 
     if (weight < 0) {
       SaveAccumulatorScope accumulator_scope(&basm_);
-      CallRuntime(Runtime::kBytecodeBudgetInterruptFromBytecode,
+      CallRuntime(Runtime::kBytecodeBudgetInterruptWithStackCheckFromBytecode,
                   __ FunctionOperand());
     }
   }
@@ -1871,7 +1890,7 @@ void BaselineCompiler::VisitJumpLoop() {
     Register osr_level = scratch;
     __ LoadRegister(osr_level, interpreter::Register::bytecode_array());
     __ LoadByteField(osr_level, osr_level,
-                     BytecodeArray::kOsrNestingLevelOffset);
+                     BytecodeArray::kOsrLoopNestingLevelOffset);
     int loop_depth = iterator().GetImmediateOperand(1);
     __ JumpIfByte(Condition::kUnsignedLessThanEqual, osr_level, loop_depth,
                   &osr_not_armed);
@@ -2057,7 +2076,7 @@ void BaselineCompiler::VisitSetPendingMessage() {
   BaselineAssembler::ScratchRegisterScope scratch_scope(&basm_);
   Register pending_message = scratch_scope.AcquireScratch();
   __ Move(pending_message,
-          ExternalReference::address_of_pending_message_obj(isolate_));
+          ExternalReference::address_of_pending_message(local_isolate_));
   Register tmp = scratch_scope.AcquireScratch();
   __ Move(tmp, kInterpreterAccumulatorRegister);
   __ Move(kInterpreterAccumulatorRegister, MemOperand(pending_message, 0));
@@ -2252,4 +2271,4 @@ DEBUG_BREAK_BYTECODE_LIST(DEBUG_BREAK)
 }  // namespace internal
 }  // namespace v8
 
-#endif
+#endif  // ENABLE_SPARKPLUG

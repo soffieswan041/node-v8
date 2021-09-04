@@ -8,6 +8,7 @@
 #include "src/base/platform/wrappers.h"
 #include "src/heap/memory-chunk.h"
 #include "src/wasm/baseline/liftoff-assembler.h"
+#include "src/wasm/wasm-objects.h"
 
 namespace v8 {
 namespace internal {
@@ -78,16 +79,16 @@ inline MemOperand GetMemOp(LiftoffAssembler* assm, Register addr,
   if (is_uint31(offset_imm)) {
     int32_t offset_imm32 = static_cast<int32_t>(offset_imm);
     if (offset == no_reg) return MemOperand(addr, offset_imm32);
-    assm->Add64(kScratchReg, addr, offset);
-    return MemOperand(kScratchReg, offset_imm32);
+    assm->Add64(kScratchReg2, addr, offset);
+    return MemOperand(kScratchReg2, offset_imm32);
   }
   // Offset immediate does not fit in 31 bits.
-  assm->li(kScratchReg, offset_imm);
-  assm->Add64(kScratchReg, kScratchReg, addr);
+  assm->li(kScratchReg2, offset_imm);
+  assm->Add64(kScratchReg2, kScratchReg2, addr);
   if (offset != no_reg) {
-    assm->Add64(kScratchReg, kScratchReg, offset);
+    assm->Add64(kScratchReg2, kScratchReg2, offset);
   }
-  return MemOperand(kScratchReg, 0);
+  return MemOperand(kScratchReg2, 0);
 }
 
 inline void Load(LiftoffAssembler* assm, LiftoffRegister dst, MemOperand src,
@@ -127,10 +128,10 @@ inline void Store(LiftoffAssembler* assm, Register base, int32_t offset,
       assm->Usd(src.gp(), dst);
       break;
     case kF32:
-      assm->UStoreFloat(src.fp(), dst);
+      assm->UStoreFloat(src.fp(), dst, kScratchReg);
       break;
     case kF64:
-      assm->UStoreDouble(src.fp(), dst);
+      assm->UStoreDouble(src.fp(), dst, kScratchReg);
       break;
     default:
       UNREACHABLE();
@@ -277,10 +278,9 @@ inline void ChangeEndiannessStore(LiftoffAssembler* assm, LiftoffRegister src,
 
 int LiftoffAssembler::PrepareStackFrame() {
   int offset = pc_offset();
-  // When constant that represents size of stack frame can't be represented
-  // as 16bit we need three instructions to add it to sp, so we reserve space
-  // for this case.
-  Add64(sp, sp, Operand(0L));
+  // When the frame size is bigger than 4KB, we need two instructions for
+  // stack checking, so we reserve space for this case.
+  addi(sp, sp, 0);
   nop();
   nop();
   return offset;
@@ -311,18 +311,76 @@ void LiftoffAssembler::PrepareTailCall(int num_callee_stack_params,
 
 void LiftoffAssembler::AlignFrameSize() {}
 
-void LiftoffAssembler::PatchPrepareStackFrame(int offset) {
-  int frame_size = GetTotalFrameSize() - kSystemPointerSize;
+void LiftoffAssembler::PatchPrepareStackFrame(
+    int offset, SafepointTableBuilder* safepoint_table_builder) {
+  // The frame_size includes the frame marker and the instance slot. Both are
+  // pushed as part of frame construction, so we don't need to allocate memory
+  // for them anymore.
+  int frame_size = GetTotalFrameSize() - 2 * kSystemPointerSize;
   // We can't run out of space, just pass anything big enough to not cause the
   // assembler to try to grow the buffer.
   constexpr int kAvailableSpace = 256;
   TurboAssembler patching_assembler(
       nullptr, AssemblerOptions{}, CodeObjectRequired::kNo,
       ExternalAssemblerBuffer(buffer_start_ + offset, kAvailableSpace));
-  // If bytes can be represented as 16bit, addi will be generated and two
-  // nops will stay untouched. Otherwise, lui-ori sequence will load it to
-  // register and, as third instruction, daddu will be generated.
-  patching_assembler.Add64(sp, sp, Operand(-frame_size));
+
+  if (V8_LIKELY(frame_size < 4 * KB)) {
+    // This is the standard case for small frames: just subtract from SP and be
+    // done with it.
+    patching_assembler.Add64(sp, sp, Operand(-frame_size));
+    return;
+  }
+
+  // The frame size is bigger than 4KB, so we might overflow the available stack
+  // space if we first allocate the frame and then do the stack check (we will
+  // need some remaining stack space for throwing the exception). That's why we
+  // check the available stack space before we allocate the frame. To do this we
+  // replace the {__ Add64(sp, sp, -frame_size)} with a jump to OOL code that
+  // does this "extended stack check".
+  //
+  // The OOL code can simply be generated here with the normal assembler,
+  // because all other code generation, including OOL code, has already finished
+  // when {PatchPrepareStackFrame} is called. The function prologue then jumps
+  // to the current {pc_offset()} to execute the OOL code for allocating the
+  // large frame.
+  // Emit the unconditional branch in the function prologue (from {offset} to
+  // {pc_offset()}).
+
+  int imm32 = pc_offset() - offset;
+  patching_assembler.GenPCRelativeJump(kScratchReg, imm32);
+
+  // If the frame is bigger than the stack, we throw the stack overflow
+  // exception unconditionally. Thereby we can avoid the integer overflow
+  // check in the condition code.
+  RecordComment("OOL: stack check for large frame");
+  Label continuation;
+  if (frame_size < FLAG_stack_size * 1024) {
+    Register stack_limit = kScratchReg;
+    Ld(stack_limit,
+       FieldMemOperand(kWasmInstanceRegister,
+                       WasmInstanceObject::kRealStackLimitAddressOffset));
+    Ld(stack_limit, MemOperand(stack_limit));
+    Add64(stack_limit, stack_limit, Operand(frame_size));
+    Branch(&continuation, uge, sp, Operand(stack_limit));
+  }
+
+  Call(wasm::WasmCode::kWasmStackOverflow, RelocInfo::WASM_STUB_CALL);
+  // The call will not return; just define an empty safepoint.
+  safepoint_table_builder->DefineSafepoint(this);
+  if (FLAG_debug_code) stop();
+
+  bind(&continuation);
+
+  // Now allocate the stack space. Note that this might do more than just
+  // decrementing the SP;
+  Add64(sp, sp, Operand(-frame_size));
+
+  // Jump back to the start of the function, from {pc_offset()} to
+  // right after the reserved space for the {__ Add64(sp, sp, -framesize)}
+  // (which is a Branch now).
+  int func_start_offset = offset + 2 * kInstrSize;
+  imm32 = func_start_offset - pc_offset();
+  GenPCRelativeJump(kScratchReg, imm32);
 }
 
 void LiftoffAssembler::FinishCode() { ForceConstantPoolEmissionWithoutJump(); }
@@ -494,10 +552,10 @@ void LiftoffAssembler::Load(LiftoffRegister dst, Register src_addr,
       TurboAssembler::Uld(dst.gp(), src_op);
       break;
     case LoadType::kF32Load:
-      TurboAssembler::ULoadFloat(dst.fp(), src_op);
+      TurboAssembler::ULoadFloat(dst.fp(), src_op, kScratchReg);
       break;
     case LoadType::kF64Load:
-      TurboAssembler::ULoadDouble(dst.fp(), src_op);
+      TurboAssembler::ULoadDouble(dst.fp(), src_op, kScratchReg);
       break;
     default:
       UNREACHABLE();
@@ -549,10 +607,10 @@ void LiftoffAssembler::Store(Register dst_addr, Register offset_reg,
       TurboAssembler::Usd(src.gp(), dst_op);
       break;
     case StoreType::kF32Store:
-      TurboAssembler::UStoreFloat(src.fp(), dst_op);
+      TurboAssembler::UStoreFloat(src.fp(), dst_op, kScratchReg);
       break;
     case StoreType::kF64Store:
-      TurboAssembler::UStoreDouble(src.fp(), dst_op);
+      TurboAssembler::UStoreDouble(src.fp(), dst_op, kScratchReg);
       break;
     default:
       UNREACHABLE();
@@ -1014,7 +1072,7 @@ void LiftoffAssembler::emit_i64_ctz(LiftoffRegister dst, LiftoffRegister src) {
 
 bool LiftoffAssembler::emit_i64_popcnt(LiftoffRegister dst,
                                        LiftoffRegister src) {
-  TurboAssembler::Popcnt64(dst.gp(), src.gp());
+  TurboAssembler::Popcnt64(dst.gp(), src.gp(), kScratchReg);
   return true;
 }
 
@@ -1096,7 +1154,7 @@ void LiftoffAssembler::emit_i32_ctz(Register dst, Register src) {
 }
 
 bool LiftoffAssembler::emit_i32_popcnt(Register dst, Register src) {
-  TurboAssembler::Popcnt32(dst, src);
+  TurboAssembler::Popcnt32(dst, src, kScratchReg);
   return true;
 }
 
@@ -2672,9 +2730,9 @@ void LiftoffAssembler::emit_f64x2_replace_lane(LiftoffRegister dst,
   bailout(kSimd, "emit_f64x2_replace_lane");
 }
 
-void LiftoffAssembler::emit_s128_set_if_nan(Register dst, DoubleRegister src,
+void LiftoffAssembler::emit_s128_set_if_nan(Register dst, LiftoffRegister src,
                                             Register tmp_gp,
-                                            DoubleRegister tmp_fp,
+                                            LiftoffRegister tmp_s128,
                                             ValueKind lane_kind) {
   bailout(kSimd, "emit_s128_set_if_nan");
 }

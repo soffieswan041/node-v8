@@ -489,15 +489,9 @@ void InstructionSelector::VisitLoad(Node* node) {
     case MachineRepresentation::kNone:
       UNREACHABLE();
   }
-  if (node->opcode() == IrOpcode::kPoisonedLoad) {
-    CHECK_NE(poisoning_level_, PoisoningMitigationLevel::kDontPoison);
-    opcode |= MiscField::encode(kMemoryAccessPoisoned);
-  }
 
   EmitLoad(this, node, opcode);
 }
-
-void InstructionSelector::VisitPoisonedLoad(Node* node) { VisitLoad(node); }
 
 void InstructionSelector::VisitProtectedLoad(Node* node) {
   // TODO(eholk)
@@ -569,7 +563,6 @@ void InstructionSelector::VisitStore(Node* node) {
         break;
 #else
         UNREACHABLE();
-        break;
 #endif
       case MachineRepresentation::kMapWord:            // Fall through.
       case MachineRepresentation::kNone:
@@ -1789,7 +1782,8 @@ void VisitWordCompare(InstructionSelector* selector, Node* node,
             Int32BinopMatcher m(node, true);
             NumberBinopMatcher n(node, true);
             if (m.right().Is(0) || n.right().IsZero()) {
-              VisitWordCompareZero(selector, g.UseRegister(left), cont);
+              VisitWordCompareZero(selector, g.UseRegisterOrImmediateZero(left),
+                                   cont);
             } else {
               VisitCompare(selector, opcode, g.UseRegister(left),
                            g.UseRegister(right), cont);
@@ -1802,7 +1796,8 @@ void VisitWordCompare(InstructionSelector* selector, Node* node,
         case kUnsignedGreaterThanOrEqual: {
           Int32BinopMatcher m(node, true);
           if (m.right().Is(0)) {
-            VisitWordCompareZero(selector, g.UseRegister(left), cont);
+            VisitWordCompareZero(selector, g.UseRegisterOrImmediateZero(left),
+                                 cont);
           } else {
             VisitCompare(selector, opcode, g.UseRegister(left),
                          g.UseImmediate(right), cont);
@@ -1811,7 +1806,8 @@ void VisitWordCompare(InstructionSelector* selector, Node* node,
         default:
           Int32BinopMatcher m(node, true);
           if (m.right().Is(0)) {
-            VisitWordCompareZero(selector, g.UseRegister(left), cont);
+            VisitWordCompareZero(selector, g.UseRegisterOrImmediateZero(left),
+                                 cont);
           } else {
             VisitCompare(selector, opcode, g.UseRegister(left),
                          g.UseRegister(right), cont);
@@ -1827,9 +1823,12 @@ void VisitWordCompare(InstructionSelector* selector, Node* node,
 bool IsNodeUnsigned(Node* n) {
   NodeMatcher m(n);
 
-  if (m.IsLoad() || m.IsUnalignedLoad() || m.IsPoisonedLoad() ||
-      m.IsProtectedLoad() || m.IsWord32AtomicLoad() || m.IsWord64AtomicLoad()) {
+  if (m.IsLoad() || m.IsUnalignedLoad() || m.IsProtectedLoad()) {
     LoadRepresentation load_rep = LoadRepresentationOf(n->op());
+    return load_rep.IsUnsigned();
+  } else if (m.IsWord32AtomicLoad() || m.IsWord64AtomicLoad()) {
+    AtomicLoadParameters atomic_load_params = AtomicLoadParametersOf(n->op());
+    LoadRepresentation load_rep = atomic_load_params.representation();
     return load_rep.IsUnsigned();
   } else {
     return m.IsUint32Div() || m.IsUint32LessThan() ||
@@ -1930,16 +1929,18 @@ void VisitWord64Compare(InstructionSelector* selector, Node* node,
 void EmitWordCompareZero(InstructionSelector* selector, Node* value,
                          FlagsContinuation* cont) {
   RiscvOperandGenerator g(selector);
-  selector->EmitWithContinuation(kRiscvCmpZero, g.UseRegister(value), cont);
+  selector->EmitWithContinuation(kRiscvCmpZero,
+                                 g.UseRegisterOrImmediateZero(value), cont);
 }
 
 void VisitAtomicLoad(InstructionSelector* selector, Node* node,
-                     ArchOpcode opcode) {
+                     ArchOpcode opcode, AtomicWidth width) {
   RiscvOperandGenerator g(selector);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
   if (g.CanBeImmediate(index, opcode)) {
-    selector->Emit(opcode | AddressingModeField::encode(kMode_MRI),
+    selector->Emit(opcode | AddressingModeField::encode(kMode_MRI) |
+                       AtomicWidthField::encode(width),
                    g.DefineAsRegister(node), g.UseRegister(base),
                    g.UseImmediate(index));
   } else {
@@ -1947,20 +1948,22 @@ void VisitAtomicLoad(InstructionSelector* selector, Node* node,
     selector->Emit(kRiscvAdd64 | AddressingModeField::encode(kMode_None),
                    addr_reg, g.UseRegister(index), g.UseRegister(base));
     // Emit desired load opcode, using temp addr_reg.
-    selector->Emit(opcode | AddressingModeField::encode(kMode_MRI),
+    selector->Emit(opcode | AddressingModeField::encode(kMode_MRI) |
+                       AtomicWidthField::encode(width),
                    g.DefineAsRegister(node), addr_reg, g.TempImmediate(0));
   }
 }
 
 void VisitAtomicStore(InstructionSelector* selector, Node* node,
-                      ArchOpcode opcode) {
+                      ArchOpcode opcode, AtomicWidth width) {
   RiscvOperandGenerator g(selector);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
   Node* value = node->InputAt(2);
 
   if (g.CanBeImmediate(index, opcode)) {
-    selector->Emit(opcode | AddressingModeField::encode(kMode_MRI),
+    selector->Emit(opcode | AddressingModeField::encode(kMode_MRI) |
+                       AtomicWidthField::encode(width),
                    g.NoOutput(), g.UseRegister(base), g.UseImmediate(index),
                    g.UseRegisterOrImmediateZero(value));
   } else {
@@ -1968,14 +1971,15 @@ void VisitAtomicStore(InstructionSelector* selector, Node* node,
     selector->Emit(kRiscvAdd64 | AddressingModeField::encode(kMode_None),
                    addr_reg, g.UseRegister(index), g.UseRegister(base));
     // Emit desired store opcode, using temp addr_reg.
-    selector->Emit(opcode | AddressingModeField::encode(kMode_MRI),
+    selector->Emit(opcode | AddressingModeField::encode(kMode_MRI) |
+                       AtomicWidthField::encode(width),
                    g.NoOutput(), addr_reg, g.TempImmediate(0),
                    g.UseRegisterOrImmediateZero(value));
   }
 }
 
 void VisitAtomicExchange(InstructionSelector* selector, Node* node,
-                         ArchOpcode opcode) {
+                         ArchOpcode opcode, AtomicWidth width) {
   RiscvOperandGenerator g(selector);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
@@ -1993,12 +1997,13 @@ void VisitAtomicExchange(InstructionSelector* selector, Node* node,
   temp[0] = g.TempRegister();
   temp[1] = g.TempRegister();
   temp[2] = g.TempRegister();
-  InstructionCode code = opcode | AddressingModeField::encode(addressing_mode);
+  InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
+                         AtomicWidthField::encode(width);
   selector->Emit(code, 1, outputs, input_count, inputs, 3, temp);
 }
 
 void VisitAtomicCompareExchange(InstructionSelector* selector, Node* node,
-                                ArchOpcode opcode) {
+                                ArchOpcode opcode, AtomicWidth width) {
   RiscvOperandGenerator g(selector);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
@@ -2018,12 +2023,13 @@ void VisitAtomicCompareExchange(InstructionSelector* selector, Node* node,
   temp[0] = g.TempRegister();
   temp[1] = g.TempRegister();
   temp[2] = g.TempRegister();
-  InstructionCode code = opcode | AddressingModeField::encode(addressing_mode);
+  InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
+                         AtomicWidthField::encode(width);
   selector->Emit(code, 1, outputs, input_count, inputs, 3, temp);
 }
 
 void VisitAtomicBinop(InstructionSelector* selector, Node* node,
-                      ArchOpcode opcode) {
+                      ArchOpcode opcode, AtomicWidth width) {
   RiscvOperandGenerator g(selector);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
@@ -2042,7 +2048,8 @@ void VisitAtomicBinop(InstructionSelector* selector, Node* node,
   temps[1] = g.TempRegister();
   temps[2] = g.TempRegister();
   temps[3] = g.TempRegister();
-  InstructionCode code = opcode | AddressingModeField::encode(addressing_mode);
+  InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
+                         AtomicWidthField::encode(width);
   selector->Emit(code, 1, outputs, input_count, inputs, 4, temps);
 }
 
@@ -2404,163 +2411,201 @@ void InstructionSelector::VisitMemoryBarrier(Node* node) {
 }
 
 void InstructionSelector::VisitWord32AtomicLoad(Node* node) {
-  LoadRepresentation load_rep = LoadRepresentationOf(node->op());
+  AtomicLoadParameters atomic_load_params = AtomicLoadParametersOf(node->op());
+  LoadRepresentation load_rep = atomic_load_params.representation();
   ArchOpcode opcode;
   switch (load_rep.representation()) {
     case MachineRepresentation::kWord8:
-      opcode =
-          load_rep.IsSigned() ? kWord32AtomicLoadInt8 : kWord32AtomicLoadUint8;
+      opcode = load_rep.IsSigned() ? kAtomicLoadInt8 : kAtomicLoadUint8;
       break;
     case MachineRepresentation::kWord16:
-      opcode = load_rep.IsSigned() ? kWord32AtomicLoadInt16
-                                   : kWord32AtomicLoadUint16;
+      opcode = load_rep.IsSigned() ? kAtomicLoadInt16 : kAtomicLoadUint16;
       break;
     case MachineRepresentation::kWord32:
-      opcode = kWord32AtomicLoadWord32;
+      opcode = kAtomicLoadWord32;
       break;
     default:
       UNREACHABLE();
   }
-  VisitAtomicLoad(this, node, opcode);
+  VisitAtomicLoad(this, node, opcode, AtomicWidth::kWord32);
 }
 
 void InstructionSelector::VisitWord32AtomicStore(Node* node) {
-  MachineRepresentation rep = AtomicStoreRepresentationOf(node->op());
+  AtomicStoreParameters store_params = AtomicStoreParametersOf(node->op());
+  MachineRepresentation rep = store_params.representation();
   ArchOpcode opcode;
   switch (rep) {
     case MachineRepresentation::kWord8:
-      opcode = kWord32AtomicStoreWord8;
+      opcode = kAtomicStoreWord8;
       break;
     case MachineRepresentation::kWord16:
-      opcode = kWord32AtomicStoreWord16;
+      opcode = kAtomicStoreWord16;
       break;
     case MachineRepresentation::kWord32:
-      opcode = kWord32AtomicStoreWord32;
+      opcode = kAtomicStoreWord32;
       break;
     default:
       UNREACHABLE();
   }
 
-  VisitAtomicStore(this, node, opcode);
+  VisitAtomicStore(this, node, opcode, AtomicWidth::kWord32);
 }
 
 void InstructionSelector::VisitWord64AtomicLoad(Node* node) {
-  LoadRepresentation load_rep = LoadRepresentationOf(node->op());
+  AtomicLoadParameters atomic_load_params = AtomicLoadParametersOf(node->op());
+  LoadRepresentation load_rep = atomic_load_params.representation();
   ArchOpcode opcode;
   switch (load_rep.representation()) {
     case MachineRepresentation::kWord8:
-      opcode = kRiscvWord64AtomicLoadUint8;
+      opcode = kAtomicLoadUint8;
       break;
     case MachineRepresentation::kWord16:
-      opcode = kRiscvWord64AtomicLoadUint16;
+      opcode = kAtomicLoadUint16;
       break;
     case MachineRepresentation::kWord32:
-      opcode = kRiscvWord64AtomicLoadUint32;
+      opcode = kAtomicLoadWord32;
       break;
     case MachineRepresentation::kWord64:
       opcode = kRiscvWord64AtomicLoadUint64;
       break;
+#ifdef V8_COMPRESS_POINTERS
+    case MachineRepresentation::kTaggedSigned:
+      opcode = kRiscv64LdDecompressTaggedSigned;
+      break;
+    case MachineRepresentation::kTaggedPointer:
+      opcode = kRiscv64LdDecompressTaggedPointer;
+      break;
+    case MachineRepresentation::kTagged:
+      opcode = kRiscv64LdDecompressAnyTagged;
+      break;
+#else
+    case MachineRepresentation::kTaggedSigned:   // Fall through.
+    case MachineRepresentation::kTaggedPointer:  // Fall through.
+    case MachineRepresentation::kTagged:
+      if (kTaggedSize == 8) {
+        opcode = kRiscvWord64AtomicLoadUint64;
+      } else {
+        opcode = kAtomicLoadWord32;
+      }
+      break;
+#endif
+    case MachineRepresentation::kCompressedPointer:  // Fall through.
+    case MachineRepresentation::kCompressed:
+      DCHECK(COMPRESS_POINTERS_BOOL);
+      opcode = kAtomicLoadWord32;
+      break;
     default:
       UNREACHABLE();
   }
-  VisitAtomicLoad(this, node, opcode);
+  VisitAtomicLoad(this, node, opcode, AtomicWidth::kWord64);
 }
 
 void InstructionSelector::VisitWord64AtomicStore(Node* node) {
-  MachineRepresentation rep = AtomicStoreRepresentationOf(node->op());
+  AtomicStoreParameters store_params = AtomicStoreParametersOf(node->op());
+  MachineRepresentation rep = store_params.representation();
   ArchOpcode opcode;
   switch (rep) {
     case MachineRepresentation::kWord8:
-      opcode = kRiscvWord64AtomicStoreWord8;
+      opcode = kAtomicStoreWord8;
       break;
     case MachineRepresentation::kWord16:
-      opcode = kRiscvWord64AtomicStoreWord16;
+      opcode = kAtomicStoreWord16;
       break;
     case MachineRepresentation::kWord32:
-      opcode = kRiscvWord64AtomicStoreWord32;
+      opcode = kAtomicStoreWord32;
       break;
     case MachineRepresentation::kWord64:
       opcode = kRiscvWord64AtomicStoreWord64;
       break;
+    case MachineRepresentation::kTaggedSigned:   // Fall through.
+    case MachineRepresentation::kTaggedPointer:  // Fall through.
+    case MachineRepresentation::kTagged:
+      opcode = kRiscvWord64AtomicStoreWord64;
+      break;
+    case MachineRepresentation::kCompressedPointer:  // Fall through.
+    case MachineRepresentation::kCompressed:
+      CHECK(COMPRESS_POINTERS_BOOL);
+      opcode = kAtomicStoreWord32;
+      break;
     default:
       UNREACHABLE();
   }
 
-  VisitAtomicStore(this, node, opcode);
+  VisitAtomicStore(this, node, opcode, AtomicWidth::kWord64);
 }
 
 void InstructionSelector::VisitWord32AtomicExchange(Node* node) {
   ArchOpcode opcode;
   MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Int8()) {
-    opcode = kWord32AtomicExchangeInt8;
+    opcode = kAtomicExchangeInt8;
   } else if (type == MachineType::Uint8()) {
-    opcode = kWord32AtomicExchangeUint8;
+    opcode = kAtomicExchangeUint8;
   } else if (type == MachineType::Int16()) {
-    opcode = kWord32AtomicExchangeInt16;
+    opcode = kAtomicExchangeInt16;
   } else if (type == MachineType::Uint16()) {
-    opcode = kWord32AtomicExchangeUint16;
+    opcode = kAtomicExchangeUint16;
   } else if (type == MachineType::Int32() || type == MachineType::Uint32()) {
-    opcode = kWord32AtomicExchangeWord32;
+    opcode = kAtomicExchangeWord32;
   } else {
     UNREACHABLE();
   }
 
-  VisitAtomicExchange(this, node, opcode);
+  VisitAtomicExchange(this, node, opcode, AtomicWidth::kWord32);
 }
 
 void InstructionSelector::VisitWord64AtomicExchange(Node* node) {
   ArchOpcode opcode;
   MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Uint8()) {
-    opcode = kRiscvWord64AtomicExchangeUint8;
+    opcode = kAtomicExchangeUint8;
   } else if (type == MachineType::Uint16()) {
-    opcode = kRiscvWord64AtomicExchangeUint16;
+    opcode = kAtomicExchangeUint16;
   } else if (type == MachineType::Uint32()) {
-    opcode = kRiscvWord64AtomicExchangeUint32;
+    opcode = kAtomicExchangeWord32;
   } else if (type == MachineType::Uint64()) {
     opcode = kRiscvWord64AtomicExchangeUint64;
   } else {
     UNREACHABLE();
   }
-  VisitAtomicExchange(this, node, opcode);
+  VisitAtomicExchange(this, node, opcode, AtomicWidth::kWord64);
 }
 
 void InstructionSelector::VisitWord32AtomicCompareExchange(Node* node) {
   ArchOpcode opcode;
   MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Int8()) {
-    opcode = kWord32AtomicCompareExchangeInt8;
+    opcode = kAtomicCompareExchangeInt8;
   } else if (type == MachineType::Uint8()) {
-    opcode = kWord32AtomicCompareExchangeUint8;
+    opcode = kAtomicCompareExchangeUint8;
   } else if (type == MachineType::Int16()) {
-    opcode = kWord32AtomicCompareExchangeInt16;
+    opcode = kAtomicCompareExchangeInt16;
   } else if (type == MachineType::Uint16()) {
-    opcode = kWord32AtomicCompareExchangeUint16;
+    opcode = kAtomicCompareExchangeUint16;
   } else if (type == MachineType::Int32() || type == MachineType::Uint32()) {
-    opcode = kWord32AtomicCompareExchangeWord32;
+    opcode = kAtomicCompareExchangeWord32;
   } else {
     UNREACHABLE();
   }
 
-  VisitAtomicCompareExchange(this, node, opcode);
+  VisitAtomicCompareExchange(this, node, opcode, AtomicWidth::kWord32);
 }
 
 void InstructionSelector::VisitWord64AtomicCompareExchange(Node* node) {
   ArchOpcode opcode;
   MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Uint8()) {
-    opcode = kRiscvWord64AtomicCompareExchangeUint8;
+    opcode = kAtomicCompareExchangeUint8;
   } else if (type == MachineType::Uint16()) {
-    opcode = kRiscvWord64AtomicCompareExchangeUint16;
+    opcode = kAtomicCompareExchangeUint16;
   } else if (type == MachineType::Uint32()) {
-    opcode = kRiscvWord64AtomicCompareExchangeUint32;
+    opcode = kAtomicCompareExchangeWord32;
   } else if (type == MachineType::Uint64()) {
     opcode = kRiscvWord64AtomicCompareExchangeUint64;
   } else {
     UNREACHABLE();
   }
-  VisitAtomicCompareExchange(this, node, opcode);
+  VisitAtomicCompareExchange(this, node, opcode, AtomicWidth::kWord64);
 }
 void InstructionSelector::VisitWord32AtomicBinaryOperation(
     Node* node, ArchOpcode int8_op, ArchOpcode uint8_op, ArchOpcode int16_op,
@@ -2581,15 +2626,14 @@ void InstructionSelector::VisitWord32AtomicBinaryOperation(
     UNREACHABLE();
   }
 
-  VisitAtomicBinop(this, node, opcode);
+  VisitAtomicBinop(this, node, opcode, AtomicWidth::kWord32);
 }
 
-#define VISIT_ATOMIC_BINOP(op)                                   \
-  void InstructionSelector::VisitWord32Atomic##op(Node* node) {  \
-    VisitWord32AtomicBinaryOperation(                            \
-        node, kWord32Atomic##op##Int8, kWord32Atomic##op##Uint8, \
-        kWord32Atomic##op##Int16, kWord32Atomic##op##Uint16,     \
-        kWord32Atomic##op##Word32);                              \
+#define VISIT_ATOMIC_BINOP(op)                                           \
+  void InstructionSelector::VisitWord32Atomic##op(Node* node) {          \
+    VisitWord32AtomicBinaryOperation(                                    \
+        node, kAtomic##op##Int8, kAtomic##op##Uint8, kAtomic##op##Int16, \
+        kAtomic##op##Uint16, kAtomic##op##Word32);                       \
   }
 VISIT_ATOMIC_BINOP(Add)
 VISIT_ATOMIC_BINOP(Sub)
@@ -2614,14 +2658,14 @@ void InstructionSelector::VisitWord64AtomicBinaryOperation(
   } else {
     UNREACHABLE();
   }
-  VisitAtomicBinop(this, node, opcode);
+  VisitAtomicBinop(this, node, opcode, AtomicWidth::kWord64);
 }
 
-#define VISIT_ATOMIC_BINOP(op)                                               \
-  void InstructionSelector::VisitWord64Atomic##op(Node* node) {              \
-    VisitWord64AtomicBinaryOperation(                                        \
-        node, kRiscvWord64Atomic##op##Uint8, kRiscvWord64Atomic##op##Uint16, \
-        kRiscvWord64Atomic##op##Uint32, kRiscvWord64Atomic##op##Uint64);     \
+#define VISIT_ATOMIC_BINOP(op)                                                 \
+  void InstructionSelector::VisitWord64Atomic##op(Node* node) {                \
+    VisitWord64AtomicBinaryOperation(node, kAtomic##op##Uint8,                 \
+                                     kAtomic##op##Uint16, kAtomic##op##Word32, \
+                                     kRiscvWord64Atomic##op##Uint64);          \
   }
 VISIT_ATOMIC_BINOP(Add)
 VISIT_ATOMIC_BINOP(Sub)

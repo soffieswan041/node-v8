@@ -68,6 +68,8 @@ enum class PrimitiveType { kBoolean, kNumber, kString, kSymbol };
     AsyncGeneratorYieldResolveSharedFun)                                       \
   V(AsyncIteratorValueUnwrapSharedFun, async_iterator_value_unwrap_shared_fun, \
     AsyncIteratorValueUnwrapSharedFun)                                         \
+  V(IsConcatSpreadableProtector, is_concat_spreadable_protector,               \
+    IsConcatSpreadableProtector)                                               \
   V(MapIteratorProtector, map_iterator_protector, MapIteratorProtector)        \
   V(NoElementsProtector, no_elements_protector, NoElementsProtector)           \
   V(MegaDOMProtector, mega_dom_protector, MegaDOMProtector)                    \
@@ -1105,15 +1107,14 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 
   TNode<RawPtrT> LoadJSTypedArrayExternalPointerPtr(
       TNode<JSTypedArray> holder) {
-    return LoadExternalPointerFromObject(holder,
-                                         JSTypedArray::kExternalPointerOffset,
-                                         kTypedArrayExternalPointerTag);
+    return LoadObjectField<RawPtrT>(holder,
+                                    JSTypedArray::kExternalPointerOffset);
   }
 
   void StoreJSTypedArrayExternalPointerPtr(TNode<JSTypedArray> holder,
                                            TNode<RawPtrT> value) {
-    StoreExternalPointerToObject(holder, JSTypedArray::kExternalPointerOffset,
-                                 value, kTypedArrayExternalPointerTag);
+    StoreObjectFieldNoWriteBarrier<RawPtrT>(
+        holder, JSTypedArray::kExternalPointerOffset, value);
   }
 
   // Load value from current parent frame by given offset in bytes.
@@ -1446,40 +1447,35 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // Array is any array-like type that has a fixed header followed by
   // tagged elements.
   template <typename Array, typename TIndex, typename TValue = MaybeObject>
-  TNode<TValue> LoadArrayElement(
-      TNode<Array> array, int array_header_size, TNode<TIndex> index,
-      int additional_offset = 0,
-      LoadSensitivity needs_poisoning = LoadSensitivity::kSafe);
+  TNode<TValue> LoadArrayElement(TNode<Array> array, int array_header_size,
+                                 TNode<TIndex> index,
+                                 int additional_offset = 0);
 
   template <typename TIndex>
   TNode<Object> LoadFixedArrayElement(
       TNode<FixedArray> object, TNode<TIndex> index, int additional_offset = 0,
-      LoadSensitivity needs_poisoning = LoadSensitivity::kSafe,
       CheckBounds check_bounds = CheckBounds::kAlways);
 
   // This doesn't emit a bounds-check. As part of the security-performance
   // tradeoff, only use it if it is performance critical.
-  TNode<Object> UnsafeLoadFixedArrayElement(
-      TNode<FixedArray> object, TNode<IntPtrT> index, int additional_offset = 0,
-      LoadSensitivity needs_poisoning = LoadSensitivity::kSafe) {
+  TNode<Object> UnsafeLoadFixedArrayElement(TNode<FixedArray> object,
+                                            TNode<IntPtrT> index,
+                                            int additional_offset = 0) {
     return LoadFixedArrayElement(object, index, additional_offset,
-                                 needs_poisoning, CheckBounds::kDebugOnly);
+                                 CheckBounds::kDebugOnly);
   }
 
-  TNode<Object> LoadFixedArrayElement(
-      TNode<FixedArray> object, int index, int additional_offset = 0,
-      LoadSensitivity needs_poisoning = LoadSensitivity::kSafe) {
+  TNode<Object> LoadFixedArrayElement(TNode<FixedArray> object, int index,
+                                      int additional_offset = 0) {
     return LoadFixedArrayElement(object, IntPtrConstant(index),
-                                 additional_offset, needs_poisoning);
+                                 additional_offset);
   }
   // This doesn't emit a bounds-check. As part of the security-performance
   // tradeoff, only use it if it is performance critical.
-  TNode<Object> UnsafeLoadFixedArrayElement(
-      TNode<FixedArray> object, int index, int additional_offset = 0,
-      LoadSensitivity needs_poisoning = LoadSensitivity::kSafe) {
+  TNode<Object> UnsafeLoadFixedArrayElement(TNode<FixedArray> object, int index,
+                                            int additional_offset = 0) {
     return LoadFixedArrayElement(object, IntPtrConstant(index),
-                                 additional_offset, needs_poisoning,
-                                 CheckBounds::kDebugOnly);
+                                 additional_offset, CheckBounds::kDebugOnly);
   }
 
   TNode<Object> LoadPropertyArrayElement(TNode<PropertyArray> object,
@@ -2136,7 +2132,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     kFixedArrays = 1,
     kFixedDoubleArrays = 2,
     kDontCopyCOW = 4,
-    kNewSpaceAllocationOnly = 8,
     kAllFixedArrays = kFixedArrays | kFixedDoubleArrays,
     kAllFixedArraysDontCopyCOW = kAllFixedArrays | kDontCopyCOW
   };
@@ -2546,6 +2541,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsPromiseResolveProtectorCellInvalid();
   TNode<BoolT> IsPromiseThenProtectorCellInvalid();
   TNode<BoolT> IsArraySpeciesProtectorCellInvalid();
+  TNode<BoolT> IsIsConcatSpreadableProtectorCellInvalid();
   TNode<BoolT> IsTypedArraySpeciesProtectorCellInvalid();
   TNode<BoolT> IsRegExpSpeciesProtectorCellInvalid();
   TNode<BoolT> IsPromiseSpeciesProtectorCellInvalid();
@@ -3566,6 +3562,10 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<UintPtrT> LoadVariableLengthJSTypedArrayByteLength(
       TNode<Context> context, TNode<JSTypedArray> array,
       TNode<JSArrayBuffer> buffer);
+  void IsTypedArrayDetachedOrOutOfBounds(TNode<JSTypedArray> array,
+                                         Label* detached_or_oob,
+                                         Label* not_detached_nor_oob);
+
   TNode<IntPtrT> RabGsabElementsKindToElementByteSize(
       TNode<Int32T> elementsKind);
   TNode<RawPtrT> LoadJSTypedArrayDataPtr(TNode<JSTypedArray> typed_array);
@@ -4079,7 +4079,7 @@ class V8_EXPORT_PRIVATE CodeStubArguments {
   CodeStubArguments(CodeStubAssembler* assembler,
                     TorqueStructArguments torque_arguments)
       : assembler_(assembler),
-        argc_(torque_arguments.length),
+        argc_(torque_arguments.actual_count),
         base_(torque_arguments.base),
         fp_(torque_arguments.frame) {}
 
@@ -4097,12 +4097,12 @@ class V8_EXPORT_PRIVATE CodeStubArguments {
   TNode<Object> AtIndex(int index) const;
 
   // Return the number of arguments (excluding the receiver).
-  TNode<IntPtrT> GetLength() const { return argc_; }
+  TNode<IntPtrT> GetLengthWithoutReceiver() const;
   // Return the number of arguments (including the receiver).
   TNode<IntPtrT> GetLengthWithReceiver() const;
 
   TorqueStructArguments GetTorqueArguments() const {
-    return TorqueStructArguments{fp_, base_, argc_};
+    return TorqueStructArguments{fp_, base_, GetLengthWithoutReceiver(), argc_};
   }
 
   TNode<Object> GetOptionalArgumentValue(TNode<IntPtrT> index,
